@@ -1406,6 +1406,139 @@ class DiscordAdapter(BasePlatformAdapter):
             if self._is_forum_parent(channel):
                 return await self._send_to_forum(channel, content)
 
+            # ----------------------------------------------------------------
+            # Webhook-based per-agent identity (feature-flagged)
+            # ----------------------------------------------------------------
+            _hermes_env = os.environ.get("HERMES_DISCORD_WEBHOOK_IDENTITY", "")
+            _use_webhook = _hermes_env.lower() in ("1", "true", "yes")
+            _agent_override = None
+            if metadata:
+                _agent_override = metadata.get("channel_prompt") or metadata.get("agent_key")
+                # Command/system responses need native reply_to for threading.
+                # Webhook posts can't carry message_reference cleanly — route through bot.send.
+                if metadata.get("is_command_response") or metadata.get("is_system_message") or metadata.get("reply_to"):
+                    _use_webhook = False
+                # File uploads can't go through Discord webhooks; route through bot path
+                # so _send_file_attachment is invoked with the file object natively.
+                if metadata.get("file_path") or metadata.get("attachments") or metadata.get("files"):
+                    _use_webhook = False
+                # Rich embeds bypass webhook path; we ship them via bot.send below.
+                if metadata.get("embed") or metadata.get("embeds"):
+                    _use_webhook = False
+
+            if _use_webhook and content:
+                from gateway.platforms.discord_webhook_identity import (
+                    resolve_for_channel,
+                    send_via_webhook,
+                )
+                # Discord ChannelType integer mapping:
+                #   0=text, 1=DM, 2=voice, 3=group_DM, 4=category, 5=news,
+                #   10=news_thread, 11=public_thread, 12=private_thread,
+                #   13=stage_voice, 15=forum, 16=media
+                _channel_type = getattr(channel, "type", None)
+                try:
+                    _ct_int = (
+                        int(_channel_type.value)
+                        if hasattr(_channel_type, "value")
+                        else (int(_channel_type) if _channel_type is not None else None)
+                    )
+                except (TypeError, ValueError):
+                    _ct_int = None
+                _is_dm = _ct_int in (1, 3)
+                _is_voice = _ct_int in (2, 13)
+                _is_thread = _ct_int in (10, 11, 12)
+                # Threads: webhooks live on the parent channel; pass thread_id
+                _parent_id = getattr(channel, "parent_id", None)
+                _lookup_id = str(_parent_id) if (_is_thread and _parent_id) else str(channel.id)
+                _thread_id = (
+                    str(channel.id)
+                    if _is_thread
+                    else (metadata.get("thread_id") if metadata else None)
+                )
+                _mapping = resolve_for_channel(_lookup_id, agent_override=_agent_override)
+                if _mapping and _mapping.get("webhook_url") and not _is_dm and not _is_voice:
+                    try:
+                        _webhook_url = _mapping["webhook_url"]
+                        _username = _mapping.get("username", "Ava")
+                        _avatar_url = _mapping.get("avatar_url")
+                        _final_content = self.format_message(content)
+                        _webhook_msg = await send_via_webhook(
+                            _webhook_url,
+                            _username,
+                            _avatar_url,
+                            _final_content,
+                            thread_id=_thread_id,
+                            wait=True,
+                        )
+                        if _webhook_msg:
+                            _mid = str(_webhook_msg.get("id", ""))
+                            logger.info(
+                                "[%s] Posting via webhook as %s for channel %s thread %s",
+                                self.name,
+                                _username,
+                                channel.id,
+                                _thread_id or "none",
+                            )
+                            return SendResult(
+                                success=True,
+                                message_id=_mid,
+                                raw_response={"message_ids": [_mid], "via": "webhook"},
+                            )
+                    except Exception as _wexc:
+                        logger.debug(
+                            "[%s] Webhook send failed, falling back to channel.send: %s",
+                            self.name,
+                            _wexc,
+                        )
+
+            # TODO: send_file_attachment uses a different path for file uploads;
+            #        webhooks do not support file uploads natively.  Leave file
+            #        replies on the regular bot.send path.  See
+            #        gateway/platforms/discord.py:_send_file_attachment
+
+            # ----------------------------------------------------------------
+            # Embed spec: takes priority over plain-text formatting.
+            # ----------------------------------------------------------------
+            _embed_spec = None
+            if metadata:
+                _embed_spec = metadata.get("embed") or (
+                    metadata.get("embeds")[0]
+                    if isinstance(metadata.get("embeds"), list) and metadata.get("embeds")
+                    else None
+                )
+            if _embed_spec and isinstance(_embed_spec, dict):
+                try:
+                    from gateway.platforms.discord_embed_helpers import (
+                        build_embed_from_spec,
+                        color_for_agent,
+                    )
+                    if "color" not in _embed_spec and _agent_override:
+                        _embed_spec["color"] = color_for_agent(_agent_override)
+                    _embed_obj = build_embed_from_spec(_embed_spec)
+                    if _embed_obj is not None:
+                        _reply_target = None
+                        if metadata and metadata.get("reply_to"):
+                            try:
+                                _reply_target = await channel.fetch_message(int(metadata["reply_to"]))
+                            except Exception:
+                                _reply_target = None
+                        _caption = self.format_message(content) if content else None
+                        if _reply_target is not None:
+                            sent = await _reply_target.reply(content=_caption, embed=_embed_obj)
+                        else:
+                            sent = await channel.send(content=_caption, embed=_embed_obj)
+                        return SendResult(
+                            success=True,
+                            message_id=str(sent.id),
+                            raw_response={"message_ids": [str(sent.id)], "via": "embed"},
+                        )
+                except Exception as _eexc:
+                    logger.warning(
+                        "[%s] Embed send failed, falling back to plain text: %s",
+                        self.name,
+                        _eexc,
+                    )
+
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
@@ -1602,6 +1735,38 @@ class DiscordAdapter(BasePlatformAdapter):
             formatted = self.format_message(content)
             if len(formatted) > self.MAX_MESSAGE_LENGTH:
                 formatted = formatted[:self.MAX_MESSAGE_LENGTH - 3] + "..."
+            # Webhook-authored messages can't be edited by the bot (50005 Forbidden).
+            # Route to the webhook edit endpoint when msg.webhook_id is set.
+            _webhook_id = getattr(msg, "webhook_id", None)
+            if _webhook_id:
+                try:
+                    from gateway.platforms.discord_webhook_identity import (
+                        load_identity_map,
+                        edit_via_webhook,
+                    )
+                    _imap = load_identity_map()
+                    _channels = _imap.get("channels", {}) if isinstance(_imap, dict) else {}
+                    _webhook_url = None
+                    for _ch_meta in _channels.values():
+                        if str(_ch_meta.get("webhook_id")) == str(_webhook_id):
+                            _webhook_url = _ch_meta.get("webhook_url")
+                            break
+                    if _webhook_url:
+                        await edit_via_webhook(_webhook_url, message_id=str(msg.id), content=formatted)
+                        return SendResult(success=True, message_id=message_id)
+                    logger.debug(
+                        "[%s] No webhook URL for webhook_id=%s; skipping edit (would 403)",
+                        self.name,
+                        _webhook_id,
+                    )
+                    return SendResult(success=True, message_id=message_id)
+                except Exception as _wexc:
+                    logger.debug(
+                        "[%s] edit_via_webhook failed (%s); swallowing edit to avoid 403 noise",
+                        self.name,
+                        _wexc,
+                    )
+                    return SendResult(success=True, message_id=message_id)
             await msg.edit(content=formatted)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
@@ -3011,6 +3176,41 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_restart(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/restart", "Restart requested~")
 
+        @tree.command(name="morning", description="Run Henry's morning brief now and post it inline")
+        async def slash_morning(interaction: discord.Interaction):
+            # Brief takes >3s to generate; defer to keep the interaction alive.
+            try:
+                await interaction.response.defer(thinking=True)
+            except Exception as exc:  # already responded / unknown interaction
+                logger.warning("[%s] /morning defer failed: %s", self.name, exc)
+            script = "/Users/michael/.hermes/scripts/discord-morning-brief.sh"
+            try:
+                proc = await asyncio.to_thread(
+                    subprocess.run,
+                    [script, "--once", "--stdout"],
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                )
+                body = (proc.stdout or "").strip()
+                if not body:
+                    body = "Morning brief posted to #fleet."
+                if len(body) > 1900:
+                    body = body[:1897] + "..."
+                await interaction.followup.send(body)
+            except subprocess.TimeoutExpired:
+                logger.exception("[%s] /morning timed out", self.name)
+                try:
+                    await interaction.followup.send("Morning brief timed out after 180s.")
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.exception("[%s] /morning failed: %s", self.name, exc)
+                try:
+                    await interaction.followup.send(f"Morning brief failed: {exc}")
+                except Exception:
+                    pass
+
         @tree.command(name="approve", description="Approve a pending dangerous command")
         @discord.app_commands.describe(scope="Optional: 'all', 'session', 'always', 'all session', 'all always'")
         async def slash_approve(interaction: discord.Interaction, scope: str = ""):
@@ -3337,6 +3537,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     "[%s] %d skill(s) filtered out of /skill (name clamp / reserved)",
                     self.name, self._skill_group_hidden_count,
                 )
+            # end of else for _skip_skill
         except Exception as exc:
             logger.warning("[%s] Failed to register /skill command: %s", self.name, exc)
 
