@@ -1382,6 +1382,27 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            # Snooze guard: when a channel is /snoozed, suppress bot-initiated proactive posts.
+            # User-prompted replies (reply_to / is_command_response / is_system_message)
+            # always go through — see /snooze command UX promise.
+            try:
+                _is_user_initiated = bool(metadata) and bool(
+                    metadata.get("reply_to")
+                    or metadata.get("is_command_response")
+                    or metadata.get("is_system_message")
+                )
+                if not _is_user_initiated:
+                    from gateway.platforms.discord_ops_state import is_snoozed
+                    if is_snoozed(str(chat_id)):
+                        logger.info(
+                            "[%s] Skipping proactive send to channel %s (snoozed)",
+                            self.name, chat_id,
+                        )
+                        return SendResult(success=True)
+            except Exception:
+                # Snooze check is best-effort; never block real sends on its failure.
+                pass
+
             # Determine target channel: thread_id in metadata takes precedence.
             thread_id = None
             if metadata and metadata.get("thread_id"):
@@ -3283,9 +3304,28 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_fix(interaction: discord.Interaction, description: str):
             try:
                 from gateway.platforms.discord_ops_state import log_fix
+                from gateway.platforms.discord_embed_helpers import (
+                    build_embed_from_spec,
+                    color_for_agent,
+                )
                 log_fix(str(interaction.user), str(interaction.channel_id), description)
-                msg = f"🔧 Fix logged by {interaction.user.mention}: {description}"
-                await interaction.response.send_message(msg)
+                truncated = description[:1000] if len(description) > 1000 else description
+                embed_spec = {
+                    "title": "🔧 Fix logged",
+                    "description": truncated,
+                    "color": color_for_agent("victor"),
+                    "fields": [
+                        {"name": "Reporter", "value": str(interaction.user.mention), "inline": True},
+                        {"name": "Channel", "value": f"<#{interaction.channel_id}>", "inline": True},
+                    ],
+                    "timestamp": "now",
+                }
+                embed = build_embed_from_spec(embed_spec)
+                if embed is None:
+                    msg = f"🔧 Fix logged by {interaction.user.mention}: {description}"
+                    await interaction.response.send_message(msg)
+                else:
+                    await interaction.response.send_message(embed=embed)
             except Exception as exc:
                 logger.exception("[%s] /fix failed: %s", self.name, exc)
                 try:
@@ -3500,6 +3540,13 @@ class DiscordAdapter(BasePlatformAdapter):
         ``tree.sync()`` call.
         """
         try:
+            import os as _os
+            if _os.environ.get("HERMES_DISCORD_SKIP_SKILL_AUTOCOMPLETE", "").lower() in ("1", "true", "yes"):
+                logger.info(
+                    "[%s] /skill autocomplete registration suppressed by HERMES_DISCORD_SKIP_SKILL_AUTOCOMPLETE",
+                    self.name,
+                )
+                return
             existing_names = set()
             try:
                 existing_names = {cmd.name for cmd in tree.get_commands()}
