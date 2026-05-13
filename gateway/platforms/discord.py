@@ -3246,6 +3246,77 @@ class DiscordAdapter(BasePlatformAdapter):
         @discord.app_commands.describe(prompt="The prompt to run in the background")
         async def slash_background(interaction: discord.Interaction, prompt: str):
             await self._run_simple_slash(interaction, f"/background {prompt}", "Background task started~")
+        @tree.command(name="ack", description="Acknowledge a message or alert")
+        @discord.app_commands.describe(note="Optional note to include with the acknowledgment")
+        async def slash_ack(interaction: discord.Interaction, note: str = ""):
+            try:
+                import time as _time
+                ts = int(_time.time())
+                note_part = f" — {note}" if note else ""
+                msg = f"✅ Acknowledged by {interaction.user.mention} at <t:{ts}:t>{note_part}"
+                await interaction.response.send_message(msg)
+            except Exception as exc:
+                logger.exception("[%s] /ack failed: %s", self.name, exc)
+                try:
+                    await interaction.response.send_message(f"/ack failed: {exc}", ephemeral=True)
+                except Exception:
+                    pass
+
+        @tree.command(name="snooze", description="Snooze bot-initiated posts for a channel")
+        @discord.app_commands.describe(minutes="Minutes to snooze (1-1440)")
+        async def slash_snooze(interaction: discord.Interaction, minutes: int):
+            try:
+                from gateway.platforms.discord_ops_state import set_snooze
+                minutes = max(1, min(int(minutes), 1440))
+                epoch_until = set_snooze(str(interaction.channel_id), minutes)
+                msg = f"🔔 Channel snoozed for {minutes}m — bot-initiated posts suppressed until <t:{epoch_until}:t>. User-prompted replies still go through."
+                await interaction.response.send_message(msg)
+            except Exception as exc:
+                logger.exception("[%s] /snooze failed: %s", self.name, exc)
+                try:
+                    await interaction.response.send_message(f"/snooze failed: {exc}", ephemeral=True)
+                except Exception:
+                    pass
+
+        @tree.command(name="fix", description="Log a fix for fleet tracking")
+        @discord.app_commands.describe(description="Description of the fix (max 500 chars)")
+        async def slash_fix(interaction: discord.Interaction, description: str):
+            try:
+                from gateway.platforms.discord_ops_state import log_fix
+                log_fix(str(interaction.user), str(interaction.channel_id), description)
+                msg = f"🔧 Fix logged by {interaction.user.mention}: {description}"
+                await interaction.response.send_message(msg)
+            except Exception as exc:
+                logger.exception("[%s] /fix failed: %s", self.name, exc)
+                try:
+                    await interaction.response.send_message(f"/fix failed: {exc}", ephemeral=True)
+                except Exception:
+                    pass
+
+        @tree.command(name="postmortem", description="Post a postmortem template embed")
+        @discord.app_commands.describe(incident_id="Optional incident ID")
+        async def slash_postmortem(interaction: discord.Interaction, incident_id: str = ""):
+            try:
+                from gateway.platforms.discord_embed_helpers import build_embed_from_spec
+                spec = {
+                    "title": f"Postmortem — {incident_id or 'unassigned'}",
+                    "fields": [
+                        {"name": "Summary", "value": "(fill in)", "inline": False},
+                        {"name": "Timeline", "value": "(fill in)", "inline": False},
+                        {"name": "Root Cause", "value": "(fill in)", "inline": False},
+                        {"name": "Impact", "value": "(fill in)", "inline": False},
+                        {"name": "Action Items", "value": "(fill in)", "inline": False},
+                        {"name": "Owner", "value": "(fill in)", "inline": False},
+                    ],
+                }
+                embed = build_embed_from_spec(spec)
+                await interaction.response.send_message(embed=embed)
+            except Exception as exc:
+                logger.exception("[%s] /postmortem failed: %s", self.name, exc)
+                try:
+                    await interaction.response.send_message(f"/postmortem failed: {exc}", ephemeral=True)
+                except Exception:
+                    pass
 
         # ── Auto-register any gateway-available commands not yet on the tree ──
         # This ensures new commands added to COMMAND_REGISTRY in
